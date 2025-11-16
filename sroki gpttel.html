@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Проверка сроков Excel</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 30px; }
+        th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
+        th { background: #f9f9f9; }
+        .error { background: #ffdddd; }
+        .warning { background: #fff3cd; }
+        .hidden { display:none; }
+        #exportExcelBtn, #sendTelegramBtn {
+            padding: 8px 15px; margin: 10px 5px 20px 0;
+            background: #4caf50; color: white; border: none; cursor: pointer;
+        }
+        #sendTelegramBtn { background:#2196f3; }
+        /* Модальное окно */
+        #groupModal {
+            position: fixed; left: 0; top: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5); display: none;
+            align-items: center; justify-content: center;
+        }
+        #groupModalContent {
+            background: white; padding: 20px; border-radius: 10px;
+            width: 400px;
+        }
+        #groupModalContent h3 { margin-top: 0; }
+        .group-item { margin-bottom: 5px; }
+        .modal-btn { padding:8px 15px; border:none; cursor:pointer; margin-top:10px; }
+        .ok-btn { background:#4caf50; color:white; }
+        .cancel-btn { background:#999; color:white; }
+    </style>
+</head>
+<body>
+<h2>Загрузите Excel файл</h2>
+<input type="file" id="fileInput" accept=".xlsx, .xls">
+<div id="filterLabel" style="display:none;">
+    <label>
+        Фильтр по группе отбора:
+        <select id="groupFilter"><option value="">Все</option></select>
+    </label>
+</div>
+<button id="exportExcelBtn" class="hidden">Экспорт отчёта в Excel</button>
+<button id="sendTelegramBtn" class="hidden">Отправить отчёт в Telegram</button>
+<div id="output"></div>
+<!-- МОДАЛЬНОЕ ОКНО ДЛЯ ВЫБОРА ГРУПП -->
+<div id="groupModal">
+    <div id="groupModalContent">
+        <h3>Выберите группы для отправки</h3>
+        <div id="groupList"></div>
+        <button class="modal-btn ok-btn" id="sendSelectedGroups">Отправить</button>
+        <button class="modal-btn cancel-btn" onclick="closeModal()">Отмена</button>
+    </div>
+</div>
+<script>
+/* ======================== Настройки Telegram бота ======================== */
+const TELEGRAM_BOT_TOKEN = "7670556697:AAGfX_Q5c8w5_vFFfz0ZjOijFbKrkCO8xOk"; // ← замени
+const TELEGRAM_CHAT_ID = "-1002419152057"; // ← замени
+/* ============================================================================ */
+let allData = {};
+let lastReportRows = [];
+let allGroups = [];
+/* ===== Загрузка файла ===== */
+document.getElementById("fileInput").addEventListener("change", handleFile);
+function handleFile(e) {
+    const file = e.target.files[0];
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        const data = new Uint8Array(e.target.result);
+        const book = XLSX.read(data, { type: "array" });
+        const sheet = book.Sheets[book.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json(sheet);
+        allData = {};
+        const groupSet = new Set();
+        json.forEach(row => {
+            const art = row["Артикул"];
+            if (!art) return;
+            if (!allData[art]) allData[art] = { name: row["Товар"], rows: [] };
+            const group =
+                row["Группа отбора"] ||
+                row["группа отбора"] ||
+                row["ГРУППА ОТБОРА"] ||
+                "";
+            const rowData = {
+                cell: row["Ячейка"],
+                qty: row["Кол-во упаковок"] || row["Кол-во"],
+                prod: parseDate(row["Дата производства"]),
+                exp: parseDate(row["Дата окончания"]),
+                arr: parseDate(row["Дата поставки"]),
+                group: group.toString().trim()
+            };
+            allData[art].rows.push(rowData);
+            if (rowData.group) groupSet.add(rowData.group);
+        });
+        allGroups = Array.from(groupSet);
+        fillGroupFilter();
+        renderOutput();
+    };
+    reader.readAsArrayBuffer(file);
+}
+/* ===== Заполнение фильтра ===== */
+function fillGroupFilter() {
+    const select = document.getElementById("groupFilter");
+    select.innerHTML = '<option value="">Все</option>';
+    allGroups.sort().forEach(g => {
+        const opt = document.createElement("option");
+        opt.value = g;
+        opt.textContent = g;
+        select.appendChild(opt);
+    });
+    document.getElementById("filterLabel").style.display = "block";
+    select.onchange = renderOutput;
+}
+/* ======================= Рендер отчёта ======================= */
+function renderOutput() {
+    const selectedGroup = document.getElementById("groupFilter").value;
+    let html = "<h3>Проблемные артикулы (разница >10 дней)</h3>";
+    let hasIssues = false;
+    lastReportRows = [];
+    Object.keys(allData).forEach(art => {
+        const g = allData[art];
+        const rows = g.rows.filter(r => !selectedGroup || r.group === selectedGroup);
+        if (rows.length === 0) return;
+        const lives = rows
+            .map(r => r.prod && r.exp ? Math.floor((r.exp - r.prod) / 86400000) : null)
+            .filter(v => v !== null);
+        if (lives.length <= 1) return;
+        const diff = Math.max(...lives) - Math.min(...lives);
+        if (diff <= 10) return;
+        hasIssues = true;
+        html += `<h4>${art} — ${g.name} (группа: ${rows[0].group})</h4>`;
+        html += `
+            <table>
+                <tr>
+                    <th>Ячейка</th>
+                    <th>Кол-во</th>
+                    <th>Дата производства</th>
+                    <th>Дата окончания</th>
+                    <th>Дата поставки</th>
+                    <th>Срок, дней</th>
+                </tr>
+        `;
+        rows.forEach(r => {
+            const sl = (r.prod && r.exp) ? Math.floor((r.exp - r.prod) / 86400000) : "";
+            html += `
+                <tr class="error">
+                    <td>${r.cell || ""}</td>
+                    <td>${r.qty || ""}</td>
+                    <td>${formatDate(r.prod)}</td>
+                    <td>${formatDate(r.exp)}</td>
+                    <td>${formatDate(r.arr)}</td>
+                    <td>${sl}</td>
+                </tr>
+            `;
+            lastReportRows.push({
+                Артикул: art,
+                Товар: g.name,
+                Ячейка: r.cell,
+                Количество: r.qty,
+                "Дата производства": formatDate(r.prod),
+                "Дата окончания": formatDate(r.exp),
+                "Дата поставки": formatDate(r.arr),
+                "Срок (дней)": sl,
+                "Группа отбора": r.group
+            });
+        });
+        html += "</table>";
+    });
+    document.getElementById("output").innerHTML =
+        hasIssues ? html : "<p>Проблем не найдено.</p>";
+    document.getElementById("exportExcelBtn").classList.toggle("hidden", !hasIssues);
+    document.getElementById("sendTelegramBtn").classList.toggle("hidden", !hasIssues);
+}
+/* ======================= Экспорт Excel ======================= */
+document.getElementById("exportExcelBtn").onclick = () => {
+    if (lastReportRows.length === 0) return;
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(lastReportRows);
+    XLSX.utils.book_append_sheet(wb, ws, "Отчёт");
+    XLSX.writeFile(wb, "report.xlsx");
+};
+/* ======================= Telegram — выбор групп ======================= */
+document.getElementById("sendTelegramBtn").onclick = openModal;
+function openModal() {
+    const list = document.getElementById("groupList");
+    list.innerHTML = "";
+    allGroups.forEach(g => {
+        list.innerHTML += `
+            <div class="group-item">
+                <input type="checkbox" value="${g}" id="g_${g}" class="groupCheckbox">
+                <label for="g_${g}">${g}</label>
+            </div>`;
+    });
+    document.getElementById("groupModal").style.display = "flex";
+}
+function closeModal() {
+    document.getElementById("groupModal").style.display = "none";
+}
+/* ===== Отправка выбранных групп ===== */
+document.getElementById("sendSelectedGroups").onclick = async () => {
+    const selected = Array.from(document.querySelectorAll("#groupList input:checked")).map(cb => cb.value);
+    if (selected.length === 0) {
+        alert("Выберите хотя бы одну группу!");
+        return;
+    }
+    if (lastReportRows.length === 0) {
+        alert("Нет данных для отправки!");
+        return;
+    }
+    // фильтруем строки по выбранным группам
+    const filtered = lastReportRows.filter(r => selected.includes(r["Группа отбора"]));
+    if (filtered.length === 0) {
+        alert("В выбранных группах нет проблемных товаров!");
+        return;
+    }
+    // создаём Excel
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(filtered);
+    XLSX.utils.book_append_sheet(wb, ws, "Отчёт");
+    const excelBinary = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    const file = new Blob([excelBinary], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const formData = new FormData();
+    formData.append("file", file, "report.xlsx");
+    // отправка на сервер
+    const resp = await fetch("send.php", {
+        method: "POST",
+        body: formData
+    });
+    const txt = await resp.text();
+    alert(txt);
+    // закрыть модалку
+    closeModal();
+};
+/* ======================= Вспомогательные функции ======================= */
+function parseDate(v) {
+    if (!v) return null;
+    if (typeof v === "number") return new Date((v - 25569) * 86400000);
+    const s = String(v).trim();
+    if (/^\d{2}\.\d{2}\.\d{4}$/.test(s)) {
+        const p = s.split(".");
+        return new Date(p[2], p[1] - 1, p[0]);
+    }
+    return new Date(s);
+}
+function formatDate(d) {
+    return d && !isNaN(d) ? d.toLocaleDateString("ru-RU") : "";
+}
+</script>
+</body>
+</html>
